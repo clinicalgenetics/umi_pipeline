@@ -87,7 +87,7 @@ rule filter_consensus:
         R1_consensus = os.path.join("{condition}", "{sample}_R1_consensus.fastq.gz"),
         R2_consensus = os.path.join("{condition}", "{sample}_R2_consensus.fastq.gz")
     params:
-        ref = "/Users/leirab/ref/human_g1k_v37.fasta",
+        ref = "human_g1k_v37.fasta",
         tmp_dir ="/tmp/"
     threads:
         8
@@ -108,7 +108,7 @@ rule align_consensus:
     threads:
         8
     params:
-        ref = "/Users/leirab/ref/human_g1k_v37.fasta"
+        ref = "human_g1k_v37.fasta"
     shell:
         """
         bwa mem -t 6 {params.ref} -M {input.R1_consensus} {input.R2_consensus}\
