@@ -1,0 +1,201 @@
+import os
+import glob
+import pysam
+import snakemake
+import subprocess as sp
+import pandas as pd
+import numpy as np
+
+
+
+print('start')
+out_path = os.getcwd()
+conditions = [os.path.basename(i) for i in glob.glob(os.path.join(out_path, "*-MBL-*"))]
+samples = [os.path.basename(j) for i in conditions for j in glob.glob(os.path.join(out_path, i, "*"))]
+data_dict = dict(zip(conditions, samples))
+print(samples)
+print(conditions)
+print(data_dict)
+config = {"data":data_dict,
+          "indir": out_path,
+          "outdir": out_path,
+      	  "ref": "/proj/sens2017594/nobackup/wharf/leily/leily-sens2017594/human_g1k_v37.fasta",
+          "panel_regions": "/proj/sens2017594/nobackup/wharf/leily/leily-sens2017594/gmslymphoid_7.2_hg19_design.bed",
+          "chrs_size": "/proj/sens2017594/nobackup/wharf/leily/leily-sens2017594/hg19.chrom.sizes",
+          "bwa_idx": "/proj/sens2017594/nobackup/mbl_project_2023/bwa_idx/bwa"}
+
+
+rule all:
+	input:
+		[expand(os.path.join("{condition}", "{sample}", "tumor.merged.fgbioconsensus.bam"),
+                condition=key, sample=value) for key, value in data_dict.items()],
+		[expand(os.path.join("{condition}", "{sample}", "{sample}_R2_consensus.fastq.gz"),
+                condition=key, sample=value) for key, value in data_dict.items()],
+                [expand(os.path.join("{condition}", "{sample}", "tumor.merged.realign.bam"),
+                condition=key, sample=value) for key, value in data_dict.items()],
+                [expand(os.path.join("{condition}", "{sample}", "{condition}_{sample}.vcf.gz"),
+                condition=key, sample=value) for key, value in data_dict.items()],
+
+
+rule add_RX:
+    input:
+        os.path.join("{condition}", "{sample}", "tumor.merged.bam")
+    output:
+        os.path.join("{condition}", "{sample}", "tumor.merged.RX.bam")
+    run:
+        bam = pysam.AlignmentFile(input[0], 'rb')
+        out_bam = pysam.AlignmentFile(output[0], "wb", template=bam)
+        iter = bam.fetch(until_eof=True, multiple_iterators=True)
+        for rec in iter:
+            fixed_umi = rec.qname.split(":")[-1]
+            fixed_umi = fixed_umi.split("_")[1:]
+            A = fixed_umi[0][0:3]
+            B = fixed_umi[1][0:3]
+            fixed_umi = '-'.join([A,B])            
+	    rec.set_tag("RX", fixed_umi)
+            out_bam.write(rec)
+        bam.close()
+        out_bam.close()
+
+rule sort_tag:
+    input:
+        rx_bam = os.path.join("{condition}", "{sample}", "tumor.merged.RX.bam")
+    output:
+        tagged = os.path.join("{condition}", "{sample}", "tumor.merged.fgbiotagged.bam")
+    shell:
+        """
+        fgbio SortBam -s Queryname -i {input} -o /dev/stdout |\
+        fgbio SetMateInformation -i /dev/stdin -o {output.tagged}
+        """
+
+rule umi_group:
+    input:
+        os.path.join("{condition}", "{sample}", "tumor.merged.fgbiotagged.bam")
+    output:
+        hist = os.path.join("{condition}", "{sample}", "size_hist.paired"),
+        grouped = os.path.join("{condition}", "{sample}", "tumor.merged.fgbiogrouped.paired.bam")
+    shell:
+        """
+        fgbio GroupReadsByUmi -i {input} -s paired \
+        --family-size-histogram {output.hist} -o {output.grouped}
+        """
+
+# rule umi_group_umiTools:
+#     input:
+#         os.path.join("{condition}", "{sample}", "tumor.merged.RX.bam")
+#     output:
+#         bam = os.path.join("{condition}", "{sample}", "tumor.merged.umitools.grouped.bam"),
+#         flat = os.path.join("{condition}", "{sample}", "tumor.merged.umitools.grouped.flat")
+#     log:
+#         os.path.join("{condition}", "{sample}", "tumor.merged.umitools.grouped.log")
+#     shell:
+#         """
+#         umi_tools group -I {input} --group-out={output.flat} --output-bam
+#         -s {output.bam} --log={log} --paired --extract-umi-method=tag
+#         --umi-tag 'RX' --umi-tag-split '-'
+#         """
+rule make_consensus:
+    input:
+        os.path.join("{condition}", "{sample}", "tumor.merged.fgbiogrouped.paired.bam")
+    output:
+        bam = os.path.join("{condition}", "{sample}", "tumor.merged.fgbioconsensus.bam")
+    shell:
+        """
+        fgbio SortBam -s TemplateCoordinate -i {input} -o /dev/stdout | \
+        fgbio CallDuplexConsensusReads --min-reads 3 1 1 --threads 6 \
+        -i /dev/stdin --min-input-base-quality 20 -o {output.bam}
+        """
+
+
+rule filter_consensus:
+    input:
+        os.path.join("{condition}", "{sample}", "tumor.merged.fgbioconsensus.bam")
+    output:
+        R1_consensus = os.path.join("{condition}", "{sample}", "{sample}_R1_consensus.fastq.gz"),
+        R2_consensus = os.path.join("{condition}", "{sample}", "{sample}_R2_consensus.fastq.gz")
+    params:
+        ref = config["ref"],
+        tmp_dir ="/tmp/"
+    threads:
+        8
+    shell:
+        """
+        fgbio -Xmx16g FilterConsensusReads -i {input} -o /dev/stdout -r {params.ref} -M 4 -N 1 -E 0.010 \
+        | samtools sort -@ 6 -n \
+        | samtools fastq -1 {output.R1_consensus} -2 {output.R2_consensus} -
+        """
+
+rule align_consensus:
+    input:
+        R1_consensus = os.path.join("{condition}", "{sample}", "{sample}_R1_consensus.fastq.gz"),
+        R2_consensus = os.path.join("{condition}", "{sample}", "{sample}_R2_consensus.fastq.gz")
+    output:
+        bam = os.path.join("{condition}", "{sample}", "tumor.merged.realign.bam"),
+        index = os.path.join("{condition}", "{sample}", "tumor.merged.realign.bam.bai")
+    threads:
+        8
+    params:
+        ref = config["bwa_idx"]
+    shell:
+        """
+        bwa-mem2 mem -t 6 {params.ref} -M {input.R1_consensus} {input.R2_consensus}\
+        | samtools sort -@6 -o {output.bam} -
+        samtools index {output.bam}
+        """
+
+
+rule read_panel:
+    output:
+        temp("tmp.bed")
+    params:
+        panel = config['panel_regions'],
+        chrs_size = config['chrs_size']
+
+    run:
+        gms_lym = pd.read_csv(params['panel'], sep = '\t', header = None)
+        chrs = np.unique(gms_lym[0].values)
+        chr_size = pd.read_csv(params['chrs_size'], sep = '\t', header = None)
+        chr_path = os.path.dirname(params['chrs_size'])
+        df2save = pd.DataFrame()
+        for ch in chrs:
+             print(ch)
+             length = chr_size.loc[chr_size[0] == "chr"+ch][1].values[0]
+             print(length)
+             gms_chr = gms_lym.loc[gms_lym[0] == ch]
+             gms_chr[1] = np.maximum(gms_chr[1].astype(int)-100, 0)
+             gms_chr[2] = np.minimum(gms_chr[2].astype(int)+100, length-1)
+             if len(df2save) == 0:
+                df2save=gms_chr
+             else:
+                df2save = pd.concat([df2save, gms_chr])
+
+        df2save.to_csv(output[0], sep = "\t", header = None, index = False)
+
+rule sort_panel:
+    input:
+        tmp = "tmp.bed"
+    output:
+        regions = "region.bed"
+    shell:
+        """
+        bedtools sort -i {input.tmp}| bedtools merge > {output.regions}
+        """
+
+
+rule run_vardict:
+    input:
+        bam = os.path.join("{condition}", "{sample}", "tumor.merged.realign.bam"),
+        regions = "region.bed"
+    params:
+        ref = config["ref"],
+        tmp_dir ="/tmp/"
+    output:
+        vcf_file = os.path.join("{condition}", "{sample}", "{condition}_{sample}.vcf.gz")
+    shell:
+        """
+        VarDict -I 50 -G  {params.ref}  -f 0.01 -N TUMOR \
+        -b  {input.bam} -c 1 -S 2 -E 3 {input.regions}  | \
+        teststrandbias.R | var2vcf_valid.pl -N TUMOR -E -f 0.01 | bgzip > \
+        {output.vcf_file}
+        """
+
